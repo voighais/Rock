@@ -1,0 +1,787 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="theme-color" content="#87b7e0" />
+<title>Rock</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{width:100%;height:100%;overflow:hidden;background:#0b1424}
+  body{
+    -webkit-user-select:none;user-select:none;
+    -webkit-tap-highlight-color:transparent;
+    overscroll-behavior:none;
+  }
+  #app{position:fixed;inset:0;touch-action:none}
+  #app canvas{display:block;width:100%;height:100%}
+</style>
+</head>
+<body>
+  <div id="app"></div>
+
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+    }
+  }
+  </script>
+
+  <script type="module">
+  import * as THREE from 'three';
+
+  /* =========================================================
+     УТИЛИТЫ
+     ========================================================= */
+  const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+
+  function smoothstep(e0, e1, x) {
+    const t = clamp((x - e0) / (e1 - e0), 0, 1);
+    return t * t * (3 - 2 * t);
+  }
+
+  function hash2(x, y) {
+    const s = Math.sin(x * 127.1 + y * 311.7) * 43758.5453123;
+    return s - Math.floor(s);
+  }
+
+  function valueNoise(x, y) {
+    const xi = Math.floor(x), yi = Math.floor(y);
+    const xf = x - xi, yf = y - yi;
+    const u = xf * xf * (3 - 2 * xf);
+    const v = yf * yf * (3 - 2 * yf);
+    const a = hash2(xi, yi);
+    const b = hash2(xi + 1, yi);
+    const c = hash2(xi, yi + 1);
+    const d = hash2(xi + 1, yi + 1);
+    return a * (1 - u) * (1 - v) + b * u * (1 - v) + c * (1 - u) * v + d * u * v;
+  }
+
+  /* =========================================================
+     РЕЛЬЕФ
+     ========================================================= */
+  function terrainHeight(x, z) {
+    const d = Math.hypot(x, z);
+    const flat = smoothstep(3.2, 14.0, d);
+    const n1 = valueNoise(x * 0.018 + 42.5, z * 0.018 + 17.3);
+    const n2 = valueNoise(x * 0.055 + 8.1,  z * 0.055 + 3.7);
+    const n3 = valueNoise(x * 0.130 + 1.7,  z * 0.130 + 9.4);
+    const h = n1 * 6.2 + n2 * 1.7 + n3 * 0.55 - 3.6;
+    return h * flat;
+  }
+
+  /* =========================================================
+     ОКРУЖЕНИЕ
+     ========================================================= */
+  const isMobile = /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) ||
+                   Math.min(window.innerWidth, window.innerHeight) < 700;
+
+  const app = document.getElementById('app');
+
+  const renderer = new THREE.WebGLRenderer({
+    antialias: false,
+    powerPreference: 'high-performance',
+    stencil: false,
+    depth: true,
+  });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, isMobile ? 1.25 : 1.6));
+  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.shadowMap.enabled = !isMobile;
+  renderer.shadowMap.type = THREE.PCFShadowMap;
+  app.appendChild(renderer.domElement);
+
+  const canvas = renderer.domElement;
+  canvas.style.touchAction = 'none';
+
+  const scene = new THREE.Scene();
+  scene.fog = new THREE.Fog(0xa8cfe8, 45, 130);
+
+  const camera = new THREE.PerspectiveCamera(
+    55, window.innerWidth / window.innerHeight, 0.1, 1400
+  );
+
+  /* =========================================================
+     НЕБО
+     ========================================================= */
+  const skyMat = new THREE.ShaderMaterial({
+    uniforms: {
+      topColor:    { value: new THREE.Color(0x2e6fbf) },
+      bottomColor: { value: new THREE.Color(0xbfd9ef) },
+      sunDir:      { value: new THREE.Vector3(0, 1, 0) },
+      sunColor:    { value: new THREE.Color(0xfff0c0) },
+    },
+    vertexShader: /* glsl */`
+      varying vec3 vDir;
+      void main() {
+        vDir = normalize(position);
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }
+    `,
+    fragmentShader: /* glsl */`
+      uniform vec3 topColor;
+      uniform vec3 bottomColor;
+      uniform vec3 sunDir;
+      uniform vec3 sunColor;
+      varying vec3 vDir;
+      void main() {
+        vec3 d = normalize(vDir);
+        float h = smoothstep(-0.05, 0.55, d.y);
+        vec3 col = mix(bottomColor, topColor, h);
+        float s = max(dot(d, normalize(sunDir)), 0.0);
+        col += sunColor * pow(s, 140.0) * 1.4;
+        col += sunColor * pow(s, 9.0) * 0.16 * (1.0 - h);
+        gl_FragColor = vec4(col, 1.0);
+        #include <colorspace_fragment>
+      }
+    `,
+    side: THREE.BackSide,
+    depthWrite: false,
+    fog: false,
+  });
+  const sky = new THREE.Mesh(new THREE.SphereGeometry(600, 24, 16), skyMat);
+  sky.frustumCulled = false;
+  scene.add(sky);
+
+  /* ---------- Звёзды ---------- */
+  const STAR_COUNT = 400;
+  const starGeo = new THREE.BufferGeometry();
+  {
+    const arr = new Float32Array(STAR_COUNT * 3);
+    for (let i = 0; i < STAR_COUNT; i++) {
+      const y = 0.04 + Math.random() * 0.96;
+      const r = Math.sqrt(Math.max(0, 1 - y * y));
+      const a = Math.random() * Math.PI * 2;
+      arr[i * 3]     = Math.cos(a) * r * 520;
+      arr[i * 3 + 1] = y * 520;
+      arr[i * 3 + 2] = Math.sin(a) * r * 520;
+    }
+    starGeo.setAttribute('position', new THREE.BufferAttribute(arr, 3));
+  }
+  const starMat = new THREE.PointsMaterial({
+    color: 0xffffff,
+    size: 2.0,
+    sizeAttenuation: false,
+    transparent: true,
+    opacity: 0,
+    depthWrite: false,
+    fog: false,
+  });
+  const stars = new THREE.Points(starGeo, starMat);
+  stars.frustumCulled = false;
+  scene.add(stars);
+
+  /* =========================================================
+     СВЕТ
+     ========================================================= */
+  const hemi = new THREE.HemisphereLight(0xbfd8f0, 0x3a5a30, 0.8);
+  scene.add(hemi);
+
+  const sunLight = new THREE.DirectionalLight(0xfff0d0, 2.1);
+  if (!isMobile) {
+    sunLight.castShadow = true;
+    sunLight.shadow.mapSize.set(1024, 1024);
+    sunLight.shadow.camera.left   = -20;
+    sunLight.shadow.camera.right  =  20;
+    sunLight.shadow.camera.top    =  20;
+    sunLight.shadow.camera.bottom = -20;
+    sunLight.shadow.camera.near   = 10;
+    sunLight.shadow.camera.far    = 160;
+    sunLight.shadow.bias = -0.0006;
+    sunLight.shadow.normalBias = 0.03;
+  }
+  scene.add(sunLight);
+  scene.add(sunLight.target);
+
+  /* =========================================================
+     ЗЕМЛЯ
+     ========================================================= */
+  const T_SIZE = 240;
+  const T_SEG  = isMobile ? 60 : 80;
+
+  let terrainGeo = new THREE.PlaneGeometry(T_SIZE, T_SIZE, T_SEG, T_SEG);
+  terrainGeo.rotateX(-Math.PI / 2);
+  {
+    const p = terrainGeo.attributes.position;
+    for (let i = 0; i < p.count; i++) {
+      p.setY(i, terrainHeight(p.getX(i), p.getZ(i)));
+    }
+  }
+  terrainGeo = terrainGeo.toNonIndexed();
+
+  {
+    const p = terrainGeo.attributes.position;
+    const colors = new Float32Array(p.count * 3);
+
+    const cGrass     = new THREE.Color(0x6aa84f);
+    const cGrassDark = new THREE.Color(0x4d7c38);
+    const cRock      = new THREE.Color(0x8d8578);
+    const cSand      = new THREE.Color(0xbfae7a);
+    const tmp = new THREE.Color();
+
+    for (let i = 0; i < p.count; i += 3) {
+      const x = (p.getX(i) + p.getX(i + 1) + p.getX(i + 2)) / 3;
+      const y = (p.getY(i) + p.getY(i + 1) + p.getY(i + 2)) / 3;
+      const z = (p.getZ(i) + p.getZ(i + 1) + p.getZ(i + 2)) / 3;
+
+      const n = valueNoise(x * 0.09 + 11, z * 0.09 + 5);
+      tmp.copy(cGrass).lerp(cGrassDark, n);
+      tmp.lerp(cRock, smoothstep(2.4, 4.6, y));
+      tmp.lerp(cSand, smoothstep(-0.5, -2.4, y) * 0.65);
+
+      for (let k = 0; k < 3; k++) {
+        colors[(i + k) * 3]     = tmp.r;
+        colors[(i + k) * 3 + 1] = tmp.g;
+        colors[(i + k) * 3 + 2] = tmp.b;
+      }
+    }
+
+    terrainGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    terrainGeo.computeVertexNormals();
+  }
+
+  const terrainMat = new THREE.MeshStandardMaterial({
+    vertexColors: true,
+    flatShading: true,
+    roughness: 1,
+    metalness: 0,
+  });
+
+  const terrain = new THREE.Mesh(terrainGeo, terrainMat);
+  terrain.receiveShadow = !isMobile;
+  scene.add(terrain);
+
+  /* =========================================================
+     КАМЕНЬ — ЛЕЖИТ РОВНО
+     ========================================================= */
+  let rockGeo = new THREE.IcosahedronGeometry(1.5, 1);
+  {
+    const p = rockGeo.attributes.position;
+    const v = new THREE.Vector3();
+    for (let i = 0; i < p.count; i++) {
+      v.fromBufferAttribute(p, i);
+      const h = hash2(v.x * 5.3 + v.z * 2.1, v.y * 5.3 - v.z * 1.7);
+      v.multiplyScalar(0.80 + h * 0.34);
+      v.y *= 0.72;                       // слегка сплющен
+      p.setXYZ(i, v.x, v.y, v.z);
+    }
+  }
+  {
+    const p = rockGeo.attributes.position;
+    const colors = new Float32Array(p.count * 3);
+    const cLight = new THREE.Color(0x9d9890);
+    const cDark  = new THREE.Color(0x6a655d);
+    const tmp = new THREE.Color();
+
+    for (let i = 0; i < p.count; i += 3) {
+      const x = (p.getX(i) + p.getX(i + 1) + p.getX(i + 2)) / 3;
+      const y = (p.getY(i) + p.getY(i + 1) + p.getY(i + 2)) / 3;
+      const z = (p.getZ(i) + p.getZ(i + 1) + p.getZ(i + 2)) / 3;
+      const h = hash2(x * 9.1 + 3.3, z * 9.1 - y * 4.4);
+      tmp.copy(cDark).lerp(cLight, h);
+      for (let k = 0; k < 3; k++) {
+        colors[(i + k) * 3]     = tmp.r;
+        colors[(i + k) * 3 + 1] = tmp.g;
+        colors[(i + k) * 3 + 2] = tmp.b;
+      }
+    }
+    rockGeo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    rockGeo.computeVertexNormals();
+  }
+
+  const rockMat = new THREE.MeshStandardMaterial({
+    vertexColors: true,
+    flatShading: true,
+    roughness: 0.95,
+    metalness: 0.02,
+  });
+
+  const rock = new THREE.Mesh(rockGeo, rockMat);
+  // Лежит ровно: минимальный наклон, вертикально "прижат" к земле
+  rock.position.set(0, 1.02, 0);
+  rock.rotation.set(0.06, 0.5, 0.04);
+  rock.castShadow = !isMobile;
+  rock.receiveShadow = true;
+  scene.add(rock);
+
+  /* =========================================================
+     ДЕРЕВЬЯ
+     ========================================================= */
+  const TREE_COUNT = isMobile ? 90 : 150;
+
+  const trunkGeo = new THREE.CylinderGeometry(0.13, 0.20, 1.6, 5);
+  trunkGeo.translate(0, 0.8, 0);
+
+  const foliageGeo = new THREE.ConeGeometry(1.15, 2.9, 6);
+  foliageGeo.translate(0, 2.45, 0);
+
+  const trunkMat = new THREE.MeshStandardMaterial({
+    flatShading: true, roughness: 1, metalness: 0,
+  });
+  const foliageMat = new THREE.MeshStandardMaterial({
+    flatShading: true, roughness: 1, metalness: 0,
+  });
+
+  const trunkMesh   = new THREE.InstancedMesh(trunkGeo,   trunkMat,   TREE_COUNT);
+  const foliageMesh = new THREE.InstancedMesh(foliageGeo, foliageMat, TREE_COUNT);
+  trunkMesh.castShadow = !isMobile;
+  trunkMesh.receiveShadow = !isMobile;
+  foliageMesh.castShadow = !isMobile;
+  foliageMesh.receiveShadow = !isMobile;
+
+  {
+    const dummy = new THREE.Object3D();
+    const col = new THREE.Color();
+    let placed = 0, attempts = 0;
+
+    while (placed < TREE_COUNT && attempts < TREE_COUNT * 40) {
+      attempts++;
+      const a = Math.random() * Math.PI * 2;
+      const r = 14 + Math.random() * 105;
+      const x = Math.cos(a) * r;
+      const z = Math.sin(a) * r;
+      const y = terrainHeight(x, z);
+      if (y > 3.4) continue;
+
+      const s = 0.7 + Math.random() * 0.95;
+
+      dummy.position.set(x, y - 0.18, z);
+      dummy.rotation.set(0, Math.random() * Math.PI * 2, 0);
+      dummy.scale.set(s, s * (0.85 + Math.random() * 0.5), s);
+      dummy.updateMatrix();
+
+      trunkMesh.setMatrixAt(placed, dummy.matrix);
+      foliageMesh.setMatrixAt(placed, dummy.matrix);
+
+      col.setHSL(0.27 + Math.random() * 0.07, 0.42 + Math.random() * 0.18, 0.30 + Math.random() * 0.13);
+      foliageMesh.setColorAt(placed, col);
+
+      col.setHSL(0.08, 0.32, 0.20 + Math.random() * 0.10);
+      trunkMesh.setColorAt(placed, col);
+
+      placed++;
+    }
+
+    trunkMesh.count = placed;
+    foliageMesh.count = placed;
+    trunkMesh.instanceMatrix.needsUpdate = true;
+    foliageMesh.instanceMatrix.needsUpdate = true;
+    if (trunkMesh.instanceColor)   trunkMesh.instanceColor.needsUpdate = true;
+    if (foliageMesh.instanceColor) foliageMesh.instanceColor.needsUpdate = true;
+  }
+
+  scene.add(trunkMesh, foliageMesh);
+
+  /* =========================================================
+     МАЛЕНЬКИЕ КАМНИ
+     ========================================================= */
+  const SMALL_ROCKS = isMobile ? 45 : 70;
+  const smallGeo = new THREE.IcosahedronGeometry(0.5, 0);
+  const smallMat = new THREE.MeshStandardMaterial({
+    color: 0x8f8a80, flatShading: true, roughness: 1, metalness: 0,
+  });
+  const smallRocks = new THREE.InstancedMesh(smallGeo, smallMat, SMALL_ROCKS);
+  smallRocks.castShadow = !isMobile;
+  smallRocks.receiveShadow = !isMobile;
+  {
+    const dummy = new THREE.Object3D();
+    const col = new THREE.Color();
+    let placed = 0, attempts = 0;
+    while (placed < SMALL_ROCKS && attempts < SMALL_ROCKS * 30) {
+      attempts++;
+      const a = Math.random() * Math.PI * 2;
+      const r = 5 + Math.random() * 105;
+      const x = Math.cos(a) * r;
+      const z = Math.sin(a) * r;
+      const y = terrainHeight(x, z);
+      const s = 0.35 + Math.random() * 1.1;
+      dummy.position.set(x, y + s * 0.15, z);
+      dummy.rotation.set(Math.random() * 3, Math.random() * 3, Math.random() * 3);
+      dummy.scale.set(s, s * 0.8, s * 0.9);
+      dummy.updateMatrix();
+      smallRocks.setMatrixAt(placed, dummy.matrix);
+      col.setHSL(0.09, 0.06, 0.38 + Math.random() * 0.2);
+      smallRocks.setColorAt(placed, col);
+      placed++;
+    }
+    smallRocks.count = placed;
+    smallRocks.instanceMatrix.needsUpdate = true;
+    if (smallRocks.instanceColor) smallRocks.instanceColor.needsUpdate = true;
+  }
+  scene.add(smallRocks);
+
+  /* =========================================================
+     ОБЛАКА (инстансированные, чтобы не лагало)
+     ========================================================= */
+  const CLOUD_COUNT = isMobile ? 40 : 70;
+  const cloudGeo = new THREE.IcosahedronGeometry(1, 1);
+  const cloudMat = new THREE.MeshStandardMaterial({
+    color: 0xffffff,
+    flatShading: true,
+    roughness: 1,
+    metalness: 0,
+    transparent: true,
+    opacity: 0.92,
+    fog: false,
+  });
+
+  const cloudMesh = new THREE.InstancedMesh(cloudGeo, cloudMat, CLOUD_COUNT);
+  cloudMesh.frustumCulled = true;
+
+  // каждый puff — часть группы облаков; будем двигать через матрицы
+  const cloudData = [];   // { baseX, baseY, baseZ, sx, sy, sz, groupId, speed }
+  {
+    const dummy = new THREE.Object3D();
+    const groups = 12;
+    for (let i = 0; i < CLOUD_COUNT; i++) {
+      const groupId = i % groups;
+      const baseGroupX = ((groupId * 137.5) % 260) - 130;
+      const baseGroupY = 38 + ((groupId * 23.7) % 26);
+      const baseGroupZ = ((groupId * 71.3) % 180) - 90;
+
+      const ox = (Math.random() - 0.5) * 12;
+      const oy = (Math.random() - 0.5) * 2.2;
+      const oz = (Math.random() - 0.5) * 6;
+
+      const s = 2.4 + Math.random() * 3.2;
+
+      cloudData.push({
+        baseX: baseGroupX + ox,
+        baseY: baseGroupY + oy,
+        baseZ: baseGroupZ + oz,
+        sx: s, sy: s * 0.55, sz: s * 0.8,
+        speed: 0.8 + ((groupId * 13) % 7) * 0.15,
+        groupId,
+      });
+
+      dummy.position.set(cloudData[i].baseX, cloudData[i].baseY, cloudData[i].baseZ);
+      dummy.rotation.set(0, 0, 0);
+      dummy.scale.set(cloudData[i].sx, cloudData[i].sy, cloudData[i].sz);
+      dummy.updateMatrix();
+      cloudMesh.setMatrixAt(i, dummy.matrix);
+    }
+  }
+  cloudMesh.instanceMatrix.needsUpdate = true;
+  scene.add(cloudMesh);
+
+  const cloudDummy = new THREE.Object3D();
+
+  /* =========================================================
+     ПТИЦЫ
+     ========================================================= */
+  // Простая low-poly птица: тело (тетраэдр-сплюснутый) + 2 крыла (треугольники)
+  function createBirdGeometry() {
+    const positions = [];
+    const normals = [];
+
+    // корпус — маленький тетраэдр
+    const bodyVerts = [
+      [ 0.00,  0.00,  0.35],
+      [ 0.10,  0.04, -0.10],
+      [-0.10,  0.04, -0.10],
+      [ 0.00, -0.06, -0.05],
+    ];
+    const bodyFaces = [
+      [0,1,2],
+      [0,3,1],
+      [0,2,3],
+      [1,3,2],
+    ];
+    for (const f of bodyFaces) {
+      for (const idx of f) {
+        positions.push(...bodyVerts[idx]);
+      }
+    }
+
+    // крылья — два треугольника (left/right)
+    const wingVerts = [
+      // left wing (y up plane)
+      [0.00, 0.02, 0.10],
+      [0.85, 0.06, -0.05],
+      [0.05, 0.02, -0.20],
+      // right wing
+      [0.00, 0.02, 0.10],
+      [-0.85, 0.06, -0.05],
+      [0.05, 0.02, -0.20],
+    ];
+    for (const v of wingVerts) positions.push(...v);
+
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+    geo.computeVertexNormals();
+    return geo;
+  }
+
+  const birdGeo = createBirdGeometry();
+  const birdMat = new THREE.MeshStandardMaterial({
+    color: 0x2a2a33,
+    flatShading: true,
+    roughness: 1,
+    metalness: 0,
+    side: THREE.DoubleSide,
+  });
+
+  const BIRD_COUNT = isMobile ? 10 : 18;
+  const birds = new THREE.InstancedMesh(birdGeo, birdMat, BIRD_COUNT);
+  birds.frustumCulled = false;
+
+  const birdData = [];
+  const birdDummy = new THREE.Object3D();
+  for (let i = 0; i < BIRD_COUNT; i++) {
+    birdData.push({
+      cx: (Math.random() - 0.5) * 60,
+      cz: (Math.random() - 0.5) * 60,
+      cy: 22 + Math.random() * 22,
+      radius: 20 + Math.random() * 35,
+      speed: 0.10 + Math.random() * 0.12,
+      phase: Math.random() * Math.PI * 2,
+      dir: Math.random() < 0.5 ? -1 : 1,
+      flapPhase: Math.random() * Math.PI * 2,
+      flapSpeed: 5.5 + Math.random() * 3.5,
+      scale: 0.85 + Math.random() * 0.5,
+    });
+  }
+
+  /* =========================================================
+     УПРАВЛЕНИЕ КАМЕРОЙ
+     ========================================================= */
+  const cam = {
+    theta: 0.9,
+    phi: 1.12,
+    dist: 9.5,
+    targetTheta: 0.9,
+    targetPhi: 1.12,
+    targetDist: 9.5,
+  };
+
+  let idle = 0;
+
+  const pointers = new Map();
+  let lastX = 0, lastY = 0, pinchDist = 0;
+
+  canvas.addEventListener('pointerdown', (e) => {
+    try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    idle = 0;
+    if (pointers.size === 1) {
+      lastX = e.clientX;
+      lastY = e.clientY;
+    } else if (pointers.size === 2) {
+      const p = Array.from(pointers.values());
+      pinchDist = Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
+    }
+  });
+
+  canvas.addEventListener('pointermove', (e) => {
+    if (!pointers.has(e.pointerId)) return;
+    pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    idle = 0;
+
+    if (pointers.size === 1) {
+      const dx = e.clientX - lastX;
+      const dy = e.clientY - lastY;
+      lastX = e.clientX;
+      lastY = e.clientY;
+
+      cam.targetTheta -= dx * 0.006;
+      cam.targetPhi = clamp(cam.targetPhi - dy * 0.005, 0.32, 1.42);
+    } else if (pointers.size === 2) {
+      const p = Array.from(pointers.values());
+      const d = Math.hypot(p[0].x - p[1].x, p[0].y - p[1].y);
+      if (pinchDist > 0 && d > 0) {
+        cam.targetDist = clamp(cam.targetDist * (pinchDist / d), 4.5, 28);
+      }
+      pinchDist = d;
+    }
+  });
+
+  function endPointer(e) {
+    pointers.delete(e.pointerId);
+    if (pointers.size === 1) {
+      const p = Array.from(pointers.values())[0];
+      lastX = p.x;
+      lastY = p.y;
+      pinchDist = 0;
+    } else if (pointers.size === 0) {
+      pinchDist = 0;
+    }
+  }
+  canvas.addEventListener('pointerup', endPointer);
+  canvas.addEventListener('pointercancel', endPointer);
+  canvas.addEventListener('lostpointercapture', endPointer);
+
+  canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    cam.targetDist = clamp(cam.targetDist * (1 + e.deltaY * 0.0012), 4.5, 28);
+    idle = 0;
+  }, { passive: false });
+
+  document.addEventListener('contextmenu', (e) => e.preventDefault());
+
+  /* =========================================================
+     ДЕНЬ / НОЧЬ
+     ========================================================= */
+  const DAY_LEN = 150;
+  const DAY_OFFSET = 0.11;
+
+  const sunDir = new THREE.Vector3();
+  const sunColor = new THREE.Color();
+  const topColor = new THREE.Color();
+  const botColor = new THREE.Color();
+
+  const DAY_TOP    = new THREE.Color(0x2e6fbf);
+  const DAY_BOT    = new THREE.Color(0xbfd9ef);
+  const NIGHT_TOP  = new THREE.Color(0x030614);
+  const NIGHT_BOT  = new THREE.Color(0x0d1a2e);
+  const SUNSET_COL = new THREE.Color(0xff7b3d);
+  const NOON_SUN   = new THREE.Color(0xfff4d6);
+
+  function updateSky(t) {
+    const dayT = ((t / DAY_LEN) + DAY_OFFSET) % 1;
+    const ang = dayT * Math.PI * 2;
+    sunDir.set(Math.cos(ang), Math.sin(ang), 0.35).normalize();
+
+    const elev = sunDir.y;
+    const dayF = smoothstep(-0.12, 0.22, elev);
+
+    topColor.copy(NIGHT_TOP).lerp(DAY_TOP, dayF);
+    botColor.copy(NIGHT_BOT).lerp(DAY_BOT, dayF);
+
+    const horizonF = clamp(1 - Math.abs(elev) / 0.35, 0, 1);
+    const sunsetAmt = horizonF * smoothstep(-0.32, -0.05, elev);
+    botColor.lerp(SUNSET_COL, sunsetAmt * 0.80);
+    topColor.lerp(SUNSET_COL, sunsetAmt * 0.22);
+
+    sunColor.copy(SUNSET_COL).lerp(NOON_SUN, clamp(elev * 1.8, 0, 1));
+
+    skyMat.uniforms.topColor.value.copy(topColor);
+    skyMat.uniforms.bottomColor.value.copy(botColor);
+    skyMat.uniforms.sunDir.value.copy(sunDir);
+    skyMat.uniforms.sunColor.value.copy(sunColor);
+
+    scene.fog.color.copy(botColor);
+
+    sunLight.position.copy(sunDir).multiplyScalar(80);
+    sunLight.target.position.set(0, 0, 0);
+    sunLight.color.copy(sunColor);
+    sunLight.intensity = 2.3 * dayF;
+    sunLight.visible = dayF > 0.015;
+
+    hemi.color.copy(topColor).lerp(new THREE.Color(0xffffff), 0.25);
+    hemi.groundColor.setRGB(0.10, 0.16, 0.09);
+    hemi.intensity = 0.22 + 0.95 * dayF;
+
+    starMat.opacity = clamp(1 - dayF * 1.6, 0, 1);
+    stars.visible = starMat.opacity > 0.01;
+  }
+
+  /* =========================================================
+     ОБНОВЛЕНИЕ КАМЕРЫ
+     ========================================================= */
+  const CAM_TARGET_Y = 1.2;
+
+  function updateCamera(dt) {
+    idle += dt;
+    if (idle > 3.5) cam.targetTheta += dt * 0.06;
+
+    const k = Math.min(1, dt * 8);
+    cam.theta += (cam.targetTheta - cam.theta) * k;
+    cam.phi   += (cam.targetPhi   - cam.phi)   * k;
+    cam.dist  += (cam.targetDist  - cam.dist)  * Math.min(1, dt * 6);
+
+    const sinPhi = Math.sin(cam.phi);
+    const px = Math.sin(cam.theta) * sinPhi * cam.dist;
+    const pz = Math.cos(cam.theta) * sinPhi * cam.dist;
+    let   py = Math.cos(cam.phi) * cam.dist + CAM_TARGET_Y;
+
+    const groundY = terrainHeight(px, pz) + 1.7;
+    if (py < groundY) py = groundY;
+
+    camera.position.set(px, py, pz);
+    camera.lookAt(0, CAM_TARGET_Y, 0);
+  }
+
+  /* =========================================================
+     RESIZE
+     ========================================================= */
+  function onResize() {
+    const w = window.innerWidth;
+    const h = window.innerHeight;
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, isMobile ? 1.25 : 1.6));
+    renderer.setSize(w, h);
+  }
+  window.addEventListener('resize', onResize);
+  window.addEventListener('orientationchange', () => setTimeout(onResize, 120));
+
+  /* =========================================================
+     ГЛАВНЫЙ ЦИКЛ
+     ========================================================= */
+  const clock = new THREE.Clock();
+  let elapsed = 0;
+
+  // временный массив для обновления инстансов облаков
+  const cloudWorldX = new Float32Array(CLOUD_COUNT);
+
+  function animate() {
+    requestAnimationFrame(animate);
+
+    const dt = Math.min(clock.getDelta(), 0.1);
+    elapsed += dt;
+
+    updateSky(elapsed);
+    updateCamera(dt);
+
+    // ---- ОБЛАКА: двигаем по X, заворачиваем ----
+    for (let i = 0; i < CLOUD_COUNT; i++) {
+      const c = cloudData[i];
+      cloudWorldX[i] = c.baseX + c.speed * elapsed;
+      // заворот по кругу
+      let wx = cloudWorldX[i];
+      const range = 260;
+      wx = ((wx + range * 0.5) % range + range) % range - range * 0.5;
+
+      cloudDummy.position.set(wx, c.baseY, c.baseZ);
+      cloudDummy.rotation.set(0, 0, 0);
+      cloudDummy.scale.set(c.sx, c.sy, c.sz);
+      cloudDummy.updateMatrix();
+      cloudMesh.setMatrixAt(i, cloudDummy.matrix);
+    }
+    cloudMesh.instanceMatrix.needsUpdate = true;
+
+    // ---- ПТИЦЫ ----
+    for (let i = 0; i < BIRD_COUNT; i++) {
+      const b = birdData[i];
+      const a = b.phase + elapsed * b.speed * b.dir;
+      const x = b.cx + Math.cos(a) * b.radius;
+      const z = b.cz + Math.sin(a) * b.radius;
+
+      // направление движения (касательная к окружности)
+      const tx = -Math.sin(a) * b.dir;
+      const tz =  Math.cos(a) * b.dir;
+      const yaw = Math.atan2(tx, tz);
+
+      // лёгкое покачивание по высоте
+      const bob = Math.sin(elapsed * 1.6 + b.phase) * 0.6;
+
+      // взмахивание крыльев через масштаб по Y? Нет — через наклон по Z
+      const flap = Math.sin(elapsed * b.flapSpeed + b.flapPhase) * 0.5;
+
+      birdDummy.position.set(x, b.cy + bob, z);
+      birdDummy.rotation.set(0, yaw, flap);
+      birdDummy.scale.setScalar(b.scale);
+      birdDummy.updateMatrix();
+      birds.setMatrixAt(i, birdDummy.matrix);
+    }
+    birds.instanceMatrix.needsUpdate = true;
+
+    renderer.render(scene, camera);
+  }
+
+  animate();
+  </script>
+</body>
+</html>
